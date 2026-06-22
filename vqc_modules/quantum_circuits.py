@@ -7,7 +7,10 @@ function API (``zz_feature_map``, ``efficient_su2``, etc.).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from qiskit import QuantumCircuit
 
 logger = logging.getLogger("vqc")
 
@@ -15,7 +18,7 @@ logger = logging.getLogger("vqc")
 # Feature maps
 # -------------------------------------------------------------------------
 
-def build_feature_map(n_qubits: int, config: dict[str, Any]):  # type: ignore[return]
+def build_feature_map(n_qubits: int, config: dict[str, Any]) -> "QuantumCircuit":
     """
     Build and return a Qiskit feature-map circuit.
 
@@ -50,7 +53,7 @@ def build_feature_map(n_qubits: int, config: dict[str, Any]):  # type: ignore[re
     return fm
 
 
-def build_ansatz(n_qubits: int, config: dict[str, Any]):  # type: ignore[return]
+def build_ansatz(n_qubits: int, config: dict[str, Any]) -> "QuantumCircuit":
     """
     Build and return a Qiskit ansatz circuit.
 
@@ -105,7 +108,7 @@ def build_ansatz(n_qubits: int, config: dict[str, Any]):  # type: ignore[return]
     return ans
 
 
-def build_vqc_circuit(n_qubits: int, config: dict[str, Any]):  # type: ignore[return]
+def build_vqc_circuit(n_qubits: int, config: dict[str, Any]) -> "QuantumCircuit":
     """
     Compose feature map + ansatz into a full VQC circuit.
 
@@ -123,6 +126,6 @@ def build_vqc_circuit(n_qubits: int, config: dict[str, Any]):  # type: ignore[re
     return circuit
 
 
-def count_parameters(circuit) -> int:  # type: ignore[return]
+def count_parameters(circuit: "QuantumCircuit") -> int:
     """Return the number of trainable parameters in *circuit*."""
     return circuit.num_parameters
