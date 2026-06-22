@@ -216,3 +216,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+*.csv
+*.md
+*.txt
+*.json
+
+# Virtual environments
+TFM_env/
+venv/
+
+# Datasets
+datasets/
+
+# Experiment results
+results/
+*.out
+
+# SLURM logs
+logs/

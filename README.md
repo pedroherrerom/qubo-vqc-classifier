@@ -1,8 +1,10 @@
-# qubo-vqc-classifier
+# QML-VQC Pipeline
 
-A hybrid quantum–classical pipeline for binary molecular classification (Master in Quantum Information Science and Technologies (MQIST), Master's Thesis, University of Vigo, academic curse 2025/2026). Combines **QUBO-based feature selection** via simulated annealing with a **Variational Quantum Classifier (VQC)**, benchmarked against classical baselines (Logistic Regression, SVM-RBF) and QSVC. Designed for HPC execution on CESGA Finisterrae III using [Qiskit](https://qiskit.org/), [polypus](https://github.com/polypus) and [CUNQA](https://cunqa.readthedocs.io).
+A hybrid quantum–classical machine learning pipeline for binary classification. It combines **QUBO-based feature selection** (via simulated annealing) with a **Variational Quantum Classifier (VQC)**, designed to run on real quantum processing units through the [CUNQA](https://cunqa.readthedocs.io) framework and [polypus](https://polypus.readthedocs.io), targeting the [CESGA FT3](https://www.cesga.es) HPC cluster.
 
 > **Status:** Active research — TFM (Master's Thesis) project.
+
+- Fix local to cunqa (import source code from polypus github) _POLYPUS_QML_INFRA in training
 
 ---
 
@@ -14,43 +16,43 @@ A hybrid quantum–classical pipeline for binary molecular classification (Maste
 - [Requirements](#requirements)
 - [Configuration](#configuration)
 - [Usage](#usage)
-  - [Local / single-node run](#local--single-node-run)
-  - [HPC submission — single job (CESGA FT3)](#hpc-submission--single-job-cesga-ft3)
-  - [HPC submission — job array (CESGA FT3)](#hpc-submission--job-array-cesga-ft3)
-  - [Post-processing and plots](#post-processing-and-plots)
+  - [Local run](#local-run)
+  - [HPC submission (CESGA FT3)](#hpc-submission-cesga-ft3)
+- [Optimizers](#optimizers)
 - [Outputs](#outputs)
+- [Known issues](#known-issues)
 - [Roadmap](#roadmap)
 - [References](#references)
-- [Acknowledgements](#acknowledgements)
+
+---
 
 ## Overview
 
-The pipeline targets the practical constraints of near-term quantum devices (NISQ era): limited qubit counts and noisy gates. It tackles both explicitly:
+The pipeline addresses the practical constraints of near-term quantum devices (NISQ era): limited qubit counts and noisy gates. It tackles both constraints explicitly:
 
-1. **Feature selection via QUBO** — reduces input features to exactly *k*, so the VQC circuit fits on available qubits without depth blowup. Solved with simulated annealing (`neal`), following Muecke et al. (2023).
-2. **VQC training via polypus** — a Rust-core QML library (`polypus.qml.train`) drives PSO optimization over the variational parameters. The Rust extension handles data encoding and parameter binding internally.
-3. **Hardware-aware execution** — training runs on local Aer; evaluation can be dispatched to CUNQA QPUs with automatic fallback to local Aer.
-4. **Distributed job-array architecture** — independent runs are spread across SLURM array tasks on separate nodes, with a gated aggregation job that merges results and generates plots.
+1. **Feature selection via QUBO** — reduces the number of input features to exactly *k*, so the VQC circuit fits on available qubits without depth blowup.
+2. **Flexible optimizers** — PSO and DE via the polypus built-in QML branch, with a HYBRID strategy planned.
+3. **Hardware-aware execution** — circuits are dispatched in batches across multiple QPUs via CUNQA, with automatic fallback to polypus serial mode when QPUs are unavailable.
 
-```
+```plain
 CSV dataset
     │
     ▼
-Data preprocessing  ──►  QUBO feature selection (k features, fixed seed)
+Data preprocessing  ──►  QUBO feature selection (k features)
                                   │
                                   ▼
                         VQC circuit (k qubits)
-                        Feature Map + Trainable Ansatz
                                   │
-                          polypus.qml.train (PSO)
+                          ┌───────┴───────┐
+                      CUNQA batch     polypus fallback
+                          └───────┬───────┘
+                                  │
+                              Optimizer loop
+                               (PSO / DE)
                                   │
                                   ▼
-                    Youden's J threshold calibration
-                         (on training set only)
-                                  │
-                                  ▼
-                    Test evaluation + metrics export
-               (ROC-AUC, F1, accuracy, CSV, JSON, plots)
+                        Evaluation & export
+                    (accuracy, F1, ROC-AUC, CSV, JSON)
 ```
 
 ---
@@ -59,74 +61,59 @@ Data preprocessing  ──►  QUBO feature selection (k features, fixed seed)
 
 ### Stage 1 — Data preprocessing (`data_processing.py`)
 
-Supports two input modes:
-
-- **Dual-CSV mode** (recommended): separate `train_path` and `test_path` files preserving the official dataset split.
-- **Legacy single-CSV mode**: stratified random split via `test_size`.
-
-Steps applied (all fitted on train, applied to test):
-
-- Drop ID/irrelevant columns (`id_cols`), zero-variance columns, and high-cardinality object columns (> 30 unique values).
-- Label-encode remaining categorical variables.
-- Median imputation.
-- MinMax scaling to **[0, π]** — mandatory for angle encoding; `StandardScaler` produces unbounded angles that break the feature map.
+- Drops irrelevant columns, zero-variance columns, and high-cardinality object columns (> 30 unique values).
+- Label-encodes all remaining categorical variables.
+- Optional stratified subsampling (`max_samples`) to limit dataset size for faster iteration.
+- Stratified train/test split → median imputation → `StandardScaler` normalization.
 
 ### Stage 2 — QUBO feature selection (`feature_selection.py`)
 
-Implements Muecke et al. (2023):
+Implements the method from [Muecke et al. (2023)](#references):
 
-- Builds importance and pairwise redundancy matrices via **mutual information**.
-- Formulates a QUBO balancing relevance vs. redundancy, parameterized by `α`.
+- Builds importance and pairwise redundancy matrices using **mutual information**.
+- Formulates a QUBO that balances relevance vs. redundancy, parameterized by `α`.
 - Solves with `neal.SimulatedAnnealingSampler`.
 - Binary search over `α` until exactly `k` features are selected.
-- A **fixed seed** is enforced in array mode to guarantee identical feature subsets across all distributed tasks.
 
-This stage can be skipped (`"stages": ["quantum"]`), passing all features directly to the VQC.
+This stage can be skipped (`stages: ["quantum"]`), in which case all features are passed to the VQC.
 
 ### Stage 3 — VQC training (`training.py`, `quantum_circuits.py`)
 
-The number of selected features equals the qubit count. A fully decomposed primitive-gate circuit is built by composing:
+The number of selected features becomes the qubit count. A fully parametrized circuit is built by composing:
 
 - **Feature map** — encodes classical data into quantum states (`ZZFeatureMap`, `ZFeatureMap`, or `PauliFeatureMap`).
 - **Ansatz** — trainable unitary (`RealAmplitudes`, `EfficientSU2`, or `TwoLocal`).
 
-The feature map and ansatz are passed separately to `polypus.qml.train`. Per-generation fitness and mean-best values are captured from Rust stdout via `_PolypusStdoutInterceptor` (OS fd-level pipe) and checkpointed to CSV every N generations.
+The circuit is fully decomposed to primitive gates before execution. The feature map and ansatz are passed separately to `polypus.qml.train`, which handles data encoding and parameter binding internally. Training uses the polypus QML branch (PSO or DE); evaluation runs on CUNQA QPUs directly.
 
-**Readout:** `single_qubit` mode — `P(qubit_0 = |1⟩)` — is the default and outperforms global parity, which is maximally nonlinear for odd qubit counts.
-
-**Threshold calibration:** after training, Youden's J statistic is computed on the training set to find the optimal decision threshold `t*`. This threshold is then applied to the test set without re-fitting, preventing information leakage.
+**Classification rule:** the *odd-parity rule* — `P(label=1)` equals the fraction of shots with an odd number of 1s in the measurement bitstring. A global parity-flip correction is applied at evaluation time if the inverted threshold yields better accuracy.
 
 ---
 
 ## Project structure
 
-```
+```plain
 .
-├── main_VQC.py               # Entry point — public API and pipeline runner
-├── main_plotting.py          # Standalone post-processing and plot generation
-├── make_exp_dir.py           # Login-node helper: creates numbered experiment dir
+├── main_VQC.py               # Entry point — exposes public API and runs pipeline
+├── main_plotting.py          # Main plotting script
 ├── configVQC.json            # Default experiment configuration
-├── submit.sh                 # HPC single-job submission (CESGA FT3)
+├── submit.sh                 # HPC submission script (CESGA FT3)
 ├── qraise_job.sh             # SLURM job: provision CUNQA QPUs
 ├── vqc_job.sh                # SLURM job: run the pipeline (depends on qraise)
-├── submit_array.sh           # HPC job-array submission (CESGA FT3)
-├── vqc_array_job.sh          # SLURM array task: one chunk of independent runs
-├── aggregate_job.sh          # SLURM aggregation job: merges all task outputs
 └── vqc_modules/
     ├── __init__.py
     ├── cli.py                # Argument parsing (CLI + JSON config overlay)
-    ├── pipeline.py           # Orchestration (single-node, task, aggregate modes)
+    ├── pipeline.py           # Top-level orchestration
     ├── data_processing.py    # Preprocessing utilities
-    ├── feature_selection.py  # QUBO-QFS via simulated annealing
-    ├── quantum_circuits.py   # Circuit construction and parameter binding
-    ├── training.py           # polypus.qml.train adapter (PSO optimizer)
-    ├── backends.py           # CUNQA / local Aer execution backends
-    ├── metrics.py            # Loss, readout probability, Youden calibration
-    ├── model_comparison.py   # Classical baselines (LogReg, SVM-RBF) and QSVC
-    ├── process_metrics.py    # Post-processing: aggregation and plot dispatch
-    ├── visualizations.py     # ROC curves, confusion matrix, PSO trajectory, bars
-    ├── experiment.py         # Experiment IDs, directories, logging
-    └── serialization.py      # NumPy-safe JSON encoder + stdout interceptor
+    ├── feature_selection.py  # QUBO-QFS (simulated annealing)
+    ├── quantum_circuits.py   # Circuit construction and binding
+    ├── training.py           # Optimizer routing (PSO, DE via polypus.qml.train)
+    ├── backends.py           # CUNQA / polypus execution backends
+    ├── metrics.py            # Loss, parity probability, evaluation metrics
+    ├── process_metrics.py    # Post-processing: aggregation and plot generation
+    ├── visualizations.py     # Learning curves and confusion matrix plots
+    ├── experiment.py         # Experiment IDs, directories, logging, history export
+    └── serialization.py      # NumPy-safe JSON encoder
 ```
 
 ---
@@ -136,76 +123,58 @@ The feature map and ansatz are passed separately to `polypus.qml.train`. Per-gen
 | Dependency | Purpose |
 |---|---|
 | Python ≥ 3.10 | Runtime |
-| [Qiskit](https://qiskit.org/) ≥ 2.1 | Circuit construction (function API: `zz_feature_map`, `efficient_su2`) |
-| [Qiskit Aer](https://qiskit.github.io/qiskit-aer/) | Local circuit simulation |
+| [Qiskit](https://qiskit.org/) | Circuit construction and decomposition |
 | [dimod](https://docs.ocean.dwavesys.com/en/stable/docs_dimod/) | QUBO / BQM formulation |
 | [neal](https://docs.ocean.dwavesys.com/projects/neal/) | Simulated annealing sampler |
-| [polypus](https://github.com/polypus) *(QML branch)* | VQC training via Rust PSO |
-| [CUNQA](https://cunqa.readthedocs.io) ≥ 2.4.0 | QPU batch execution (HPC only) |
-| scikit-learn | Preprocessing, classical baselines, metrics |
-| RDKit | Molecular descriptors (dataset-specific) |
+| [polypus](https://polypus.readthedocs.io) *(QML branch)* | VQC training and fallback executor |
+| [cunqa](https://cunqa.readthedocs.io) | Native QPU batch execution (HPC only) |
+| scikit-learn | Preprocessing and classical metrics |
 | NumPy, pandas, matplotlib, seaborn | Data handling and visualization |
 
-> `cunqa` and `polypus` require specific cluster modules on CESGA (`gcc/14.3.0`, `openmpi/5.0.9`, `rust/1.88.0`). Local runs use Aer only. Installation guide to be added.
-
----
+> `cunqa` is only required for HPC execution. Local runs fall back to `polypus` automatically.
 
 ## Configuration
 
-All parameters are controlled via `configVQC.json`. CLI flags override JSON values.
-
-**Example**:
+All parameters are controlled through `configVQC.json`. CLI flags override JSON values.
 
 ```jsonc
 {
   // Data
-  "train_path": "datasets/DIA_trainingset_RDKit_descriptors.csv",
-  "test_path":  "datasets/DIA_testset_RDKit_descriptors.csv",
-  "target": "Label",
+  "data": "datasets/Student Depression Dataset.csv",
+  "target": "DIAGNOSIS",
   "outdir": "results",
-  "id_cols": ["SMILES", "fr_para_hydroxylation"],
-  "stages": ["annealing", "quantum"],   // drop "annealing" to skip QUBO selection
+  "stages": ["annealing", "quantum"],   // drop "annealing" to skip feature selection
+  "irrelevant_cols": ["id", "City"],
+  "max_samples": 500,                   // null = use full dataset
 
-  // Experiment
-  "seed": 42,
-  "num_runs": 5,
-  "k": 6,                               // features to select / qubits
-
-  // QUBO feature selection
-  "sa_num_reads": 500,
-  "sa_bins": 10,
+  // Feature selection
+  "sa_k": 5,                            // number of features to select
+  "sa_num_reads": 500,                  // SA iterations per QUBO solve
 
   // VQC optimizer
-  "optimizer": "PSO",
-  "opt_maxiter": 70,
-  "opt_population_size": 128,
-  "checkpoint_every": 10,              // checkpoint fitness to CSV every N generations
+  "optimizer": "PSO",                   // PSO | DE
+  "opt_maxiter": 25,
 
-  // Circuit architecture
+  // Circuit
   "fm_type": "ZZFeatureMap",
-  "fm_reps": 1,
+  "fm_reps": 2,
   "ansatz_type": "EfficientSU2",
-  "ansatz_reps": 1,
-  "ansatz_entanglement": "circular",
-  "ansatz_rotation_blocks": ["ry", "rz"],
+  "ansatz_reps": 2,
 
   // Backend
   "vqc_num_shots": 1024,
-  "vqc_readout": "single_qubit",
-  "vqc_train_infrastructure": "local",
-  "vqc_test_infrastructure": "local",
-  "vqc_n_workers": 32,
-  "vqc_cores_per_worker": 2
+  "vqc_n_qpus": 4,
+  "vqc_infrastructure": "cunqa"         // "cunqa" | "aer"
 }
 ```
 
-See `cli.py` for the full parameter reference.
+See `cli.py` for the full list of parameters and their defaults.
 
 ---
 
 ## Usage
 
-### Local / single-node run
+### Local run
 
 ```bash
 python main_VQC.py --config configVQC.json
@@ -216,99 +185,108 @@ Override individual parameters on the command line:
 ```bash
 python main_VQC.py \
   --config configVQC.json \
-  --opt-maxiter 70 \
-  --fm-reps 1 \
-  --ansatz-reps 1 \
-  --vqc-num-shots 1024
+  --optimizer PSO \
+  --opt-maxiter 50 \
+  --sa-k 3 \
+  --vqc-num-shots 512
 ```
 
-### HPC submission — single job (CESGA FT3)
-
-Handles the two-job SLURM chain: provisions CUNQA QPUs via `qraise`, then launches the pipeline once they are ready (skipped automatically when `vqc_test_infrastructure=local`).
+Run only the quantum stage (skip feature selection):
 
 ```bash
-bash submit.sh --config configVQC.json --vqc-time 08:00:00 --vqc-mem 8G
+python main_VQC.py --config configVQC.json --stages quantum
+```
+
+Post-process results and generate plots:
+
+```bash
+python main_VQC.py process --dir results/ --plot-metrics loss
+```
+
+### HPC submission (CESGA FT3)
+
+`submit.sh` handles the two-job dependency chain — it first provisions QPUs via `qraise`, then launches the pipeline once they are ready.
+
+```bash
+bash submit.sh --config configVQC.json --vqc-time 01:00:00 --vqc-cpus 10 --vqc-mem 8G
+```
+
+Minimum CPU rule of thumb:
+
+```bash
+--vqc-cpus ≥ 2 + (vqc_n_qpus × cores_per_qpu)
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--config` | `configVQC.json` | Experiment config file |
-| `--vqc-n-workers` | read from config | PSO parallel workers |
-| `--vqc-cores-per-worker` | read from config | CPU cores per worker |
-| `--vqc-time` | `08:00:00` | Wall-clock limit |
-| `--vqc-mem` | `8G` | Memory per job |
-| `--qraise-time` | VQC time + 1 h | CUNQA QPU lifetime |
-
-### HPC submission — job array (CESGA FT3)
-
-Spreads independent runs across SLURM array tasks (one task per run by default), then merges all outputs with a gated aggregation job. Requires `vqc_test_infrastructure=local`.
-
-```bash
-bash submit_array.sh \
-  --config configVQC.json \
-  --num-runs 10 \
-  --runs-per-task 1 \
-  --vqc-time 04:00:00 \
-  --vqc-mem 8G
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--num-runs` | read from config | Total independent runs |
-| `--runs-per-task` | `1` | Runs per array task |
-| `--max-concurrent` | `0` (no cap) | Max simultaneous tasks |
-| `--agg-time` | `01:00:00` | Aggregation job wall-clock |
+| `--n-qpus` | read from config | Number of QPUs to provision |
+| `--cores-per-qpu` | `2` | CPU cores per QPU process |
+| `--vqc-time` | `08:00:00` | Wall-clock limit for the VQC job |
+| `--vqc-cpus` | `4` | CPU cores for the VQC job |
+| `--vqc-mem` | `8G` | Memory for the VQC job |
+| `--qraise-margin` | `15` | Extra minutes added to QPU lifetime beyond VQC wall time |
 
 Monitor jobs:
 
 ```bash
 watch -n 10 squeue --me
-tail -f logs/vqc_array-<AID>_<TID>.out
-tail -f logs/vqc_aggregate-<JID>.out
+tail -f logs/vqc_pipeline-<JID>.out
+tail -f logs/qraise_vqc-<JID>.out
 ```
 
-### Post-processing and plots
+---
 
-```bash
-python main_plotting.py --dir results/<experiment_id>/
-```
+## Optimizers
 
-Regenerates all plots from existing CSVs without re-running training.
+PSO and DE are provided by `polypus.qml.train` (QML branch). The feature map and ansatz are passed separately; polypus handles data encoding and parameter binding internally.
+
+| Name | Strategy | Best for |
+|---|---|---|
+| `PSO` | Particle Swarm Optimization | Noisy landscapes, global search |
+| `DE` | Differential Evolution | Population-based global search |
 
 ---
 
 ## Outputs
 
-Each experiment writes to `<outdir>/<N>_<experiment_id>/`:
+Each experiment writes to `<outdir>/<experiment_id>/`:
 
-```
+```bash
 <experiment_id>/
-├── experiment_config.json              # Full config snapshot
-├── experiment.log                      # Timestamped run log
-├── quantum_train_historical.csv        # Per-generation fitness + mean_best (all runs)
-├── quantum_aggregated_predictions.csv  # Per-sample y_true, y_pred, y_prob (all runs)
-├── quantum_raw_metrics.json            # Per-run accuracy, F1, ROC-AUC, report
-├── model_comparison.csv                # Aggregated mean ± std across all models
-├── model_comparison_runs.csv           # Per-run values for scatter overlay
+├── experiment_config.json        # Full config snapshot
+├── experiment.log                # Timestamped run log
+├── quantum_train_historical.csv  # Long-format per-generation loss history across all runs
+├── quantum_raw_metrics.json      # Per-run accuracy, F1, ROC-AUC, classification report
 └── plots/
-    ├── quantum_pso_trajectory.png         # Global best + swarm mean across generations
-    ├── quantum_final_loss_distribution.png
-    ├── quantum_confusion_matrix.png       # Mean ± std across runs
-    ├── quantum_roc_curves.png             # Per-run + interpolated mean ± std band
-    └── model_comparison_bars.png          # Grouped bars with per-run scatter
+    ├── quantum_loss_learning_curve.png   # Mean ±1 std across runs
+    └── quantum_ConfusionMatrix.png       # Aggregated over all runs (to be implemented)
 ```
 
-In job-array mode, each task writes its own outputs under `tasks/task_NNNN/` before the aggregation job merges them into the experiment root.
+The experiment ID is deterministically derived from the config (test size, optimizer, QPU count, etc.) and truncated with a SHA-1 suffix if too long, ensuring reproducibility and avoiding directory collisions.
+
+---
+
+## Known issues
+
+- **CUNQA QPU timeout:** `run_batch` enforces a per-chunk timeout (`chunk_timeout_s=120`). Long circuits or heavy load may hit this limit; increase via the keyword argument or restructure into smaller chunks.
 
 ---
 
 ## Roadmap
 
-- [ ] Multiclass classification (architecture changes identified, deferred)
-- [ ] Real quantum hardware submission via Qiskit Runtime
-- [ ] Quantum feature selection (D-Wave annealer or QAOA-based QUBO solver)
-- [ ] `requirements.txt` / `pyproject.toml` with pinned dependencies
-- [ ] Unit tests (circuit construction, readout, QUBO formulation, backend dispatch)
+- [ ] **HYBRID optimizer** — COBYLA local phases alternating with PSO/DE escape cycles for better convergence on barren plateaus.
+- [ ] **Confusion matrix plot** — aggregate predictions across runs and generate a heatmap automatically after training.
+- [ ] **QNG optimizer** — Quantum Natural Gradient once supported by the polypus QML branch.
+- [ ] **Real quantum hardware** — submit circuits to IBM Quantum or IonQ via Qiskit Runtime.
+- [ ] **Quantum feature selection** — replace the classical SA sampler with a D-Wave quantum annealer or a QAOA-based QUBO solver.
+- [ ] **Multi-class classification** — extend the parity rule and loss function beyond binary labels.
+- [ ] **Noise-aware training** — incorporate device noise models (depolarizing, readout error) into the training loss.
+- [ ] **Ansatz search** — automate circuit architecture selection (reps, entanglement, gate set) via hyperparameter optimization.
+- [ ] **Benchmarking suite** — systematic comparison against classical baselines (SVM, XGBoost, MLP) with statistical significance testing.
+- [ ] **`requirements.txt` / `pyproject.toml`** — pinned dependency file for reproducible environments.
+- [ ] **Unit tests** — circuit construction, parity metric, QUBO formulation, and backend dispatch.
+- [ ] **Experiment tracking** — optional MLflow or Weights & Biases logging alongside CSV/JSON export.
 
 ---
 
@@ -323,10 +301,4 @@ In job-array mode, each task writes its own outputs under `tasks/task_NNNN/` bef
 
 ## License
 
-This project is part of a Master's Thesis (TFM) developed at the Universidade da Vigo, supervised by Eduardo Mosqueira (Universidade da Coruña) and Sergio Figueiras (Bahía Software SLU). License to be added upon publication.
-
----
-
-## Acknowledgements
-
-This research project was made possible through the access granted by the Galician Supercomputing Center (CESGA) to its supercomputing infrastructure. The supercomputer FinisTerrae III and its permanent data storage system have been funded by the NextGeneration EU 2021 Recovery, Transformation and Resilience Plan, ICT2021-006904, and also from the Pluriregional Operational Programme of Spain 2014-2020 of the European Regional Development Fund (ERDF), ICTS-2019-02-CESGA-3, and from the State Programme for the Promotion of Scientific and Technical Research of Excellence of the State Plan for Scientific and Technical Research and Innovation 2013-2016 State subprogramme for scientific and technical infrastructures and equipment of ERDF, CESG15-DE-3114.
+This project is part of a Master's Thesis (TFM). License to be added upon publication.
