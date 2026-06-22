@@ -235,3 +235,4 @@ results/
 
 # SLURM logs
 logs/
+*.png
